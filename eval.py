@@ -34,7 +34,6 @@ from jax import random
 from jax.config import config
 import numpy as np
 import tensorflow as tf
-import tensorflow_hub as tf_hub
 
 from hypernerf import configs
 from hypernerf import datasets
