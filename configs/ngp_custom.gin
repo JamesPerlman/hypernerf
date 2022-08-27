@@ -2,8 +2,8 @@ include 'configs/defaults.gin'
 
 
 image_scale = 4
-batch_size = 4096
-eval_batch_size = 8192
+batch_size = 1024
+eval_batch_size = 2048
 
 elastic_init_weight = 0.01
 max_steps = 250000
