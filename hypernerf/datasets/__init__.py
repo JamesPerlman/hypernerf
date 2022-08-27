@@ -17,3 +17,4 @@
 from hypernerf.datasets.core import *
 from hypernerf.datasets.interp import InterpDataSource
 from hypernerf.datasets.nerfies import NerfiesDataSource
+from hypernerf.datasets.ngp import NGPDataSource

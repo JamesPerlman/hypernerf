@@ -31,6 +31,11 @@ from hypernerf import types
 from hypernerf import utils
 from hypernerf.datasets import core
 
+FLIP_MAT = np.array([
+  [1, 0, 0],
+  [0, -1, 0],
+  [0, 0, -1],
+])
 
 def load_scene_info(
     data_dir: types.PathType) -> Tuple[np.ndarray, float, float, float]:
@@ -49,11 +54,16 @@ def load_scene_info(
   #scene_json_path = gpath.GPath(data_dir, 'scene.json')
   #with scene_json_path.open('r') as f:
   #  scene_json = json.load(f)
-
-  scene_center = np.array([0, 0, 0])
   scene_scale = 1.0
-  near = 0.1
-  far = 6.0
+  
+  scene_center = [
+    0.0,
+    0.0,
+    0.0
+  ]
+
+  near = 0.01
+  far = 16
 
   return scene_center, scene_scale, near, far
 
@@ -67,12 +77,11 @@ def _load_image(path: types.PathType) -> np.ndarray:
     return image
 
 
-def _load_dataset_ids(data_dir: types.PathType) -> Tuple[List[str], List[str]]:
+def _load_dataset_ids(transforms_path: types.PathType) -> Tuple[List[str], List[str]]:
   """Loads dataset IDs."""
-  dataset_json_path = gpath.GPath(data_dir, 'transforms.json')
-  logging.info('*** Loading dataset IDs from %s', dataset_json_path)
+  logging.info('*** Loading dataset IDs from %s', transforms_path)
   data: dict
-  with dataset_json_path.open('r') as f:
+  with transforms_path.open('r') as f:
     data = json.load(f)
   
   num_frames = len(data['frames'])
@@ -92,17 +101,26 @@ class NGPDataSource(core.DataSource):
                data_dir: str = gin.REQUIRED,
                image_scale: int = gin.REQUIRED,
                shuffle_pixels: bool = False,
-               test_camera_trajectory: str = 'orbit-mild',
+               transforms_path: str = None,
                **kwargs):
     self.data_dir = gpath.GPath(data_dir)
+    
+    if transforms_path == None:
+      self.transforms_path = gpath.GPath(data_dir, 'transforms.json')
+    else:
+      self.transforms_path = gpath.GPath(transforms_path) 
+
+    if not self.transforms_path.exists():
+      logging.warning(f'transforms.json does not exist: {str(self.transforms_path)}', )
+      return []
+
     # Load IDs from JSON if it exists. This is useful since COLMAP fails on
     # some images so this gives us the ability to skip invalid images.
-    train_ids, val_ids = _load_dataset_ids(self.data_dir)
+    train_ids, val_ids = _load_dataset_ids(self.transforms_path)
     super().__init__(train_ids=train_ids, val_ids=val_ids,
                      **kwargs)
     self.scene_center, self.scene_scale, self._near, self._far = (
         load_scene_info(self.data_dir))
-    self.test_camera_trajectory = test_camera_trajectory
 
     self.image_scale = image_scale
     self.shuffle_pixels = shuffle_pixels
@@ -111,17 +129,10 @@ class NGPDataSource(core.DataSource):
     self.depth_dir = gpath.GPath(data_dir, 'this_is_hypernerf', 'depth', f'{image_scale}x')
     self.camera_dir = gpath.GPath(data_dir, 'this_is_hypernerf', 'camera')
 
-    self.transforms_path = gpath.GPath(data_dir, 'transforms.json')
     self.checkpoint_dir = gpath.GPath(data_dir, 'checkpoints', 'hypernerf')
     
-    transforms_path = self.data_dir / 'transforms.json'
-    if not transforms_path.exists():
-      logging.warning(f'transforms.json does not exist: {str(transforms_path)}', )
-      return []
-    
-    with open(transforms_path, 'r') as f:
-      self.transforms_json = json.load(f)
-    
+    with open(self.transforms_path, 'r') as f:
+      self.transforms = json.load(f)
 
   @property
   def near(self) -> float:
@@ -135,28 +146,30 @@ class NGPDataSource(core.DataSource):
     return self.rgb_dir / f'{item_id}.png'
 
   def load_rgb(self, item_id: str) -> np.ndarray:
-    return _load_image(self.data_dir / self.transforms_json['frames'][int(item_id)]['file_path'])
+    return _load_image(self.data_dir / self.transforms['frames'][int(item_id)]['file_path'])
 
   def load_camera(self,
                   item_id: str,
-                  scale_factor: float = 1.0) -> cam.Camera:
+                  scale_factor = 1.0,
+                  transforms: dict = None) -> cam.Camera:
+    data = transforms
+    if transforms == None:
+      data = self.transforms
     
-    data = self.transforms_json
-    mat = np.array(data['frames'][int(item_id)]['transform_matrix'])[:3,:4]
-    res = cv2.decomposeProjectionMatrix(mat)
-    rot_mat = res[1]
-    pos_vec = res[2]
+    frame = data['frames'][int(item_id)]
 
+    rot_mat = np.array(frame['hypernerf']['orientation'])
+    pos_vec = np.array(frame['hypernerf']['translation'])
     camera = cam.Camera(
       orientation=rot_mat,
-      position=pos_vec[:3].reshape(3),
+      position=pos_vec,
       focal_length=data['fl_x'],
-      principal_point=np.array([data['cx'], data['cy']]),
-      image_size=np.array([data['w'], data['h']]),
+      principal_point=np.array([scale_factor * data['cx'], scale_factor * data['cy']]),
+      image_size=np.array([scale_factor * data['w'], scale_factor * data['h']]),
       skew=0.0,
       pixel_aspect_ratio=1.0,
-      radial_distortion=None,
-      tangential_distortion=None,
+      radial_distortion=[data['k1'], data['k2'], 0],
+      tangential_distortion=[data['p1'], data['p2']],
       dtype=np.float32
     )
 
@@ -166,8 +179,14 @@ class NGPDataSource(core.DataSource):
     path = gpath.GPath(path)
     return sorted(path.glob(f'*{self.camera_ext}'))
 
-  def load_test_cameras(self, count=None):
-    cameras = utils.parallel_map(self.load_camera, list(range(len(self.transforms_json['frames']))))
+  def load_test_cameras(self, count=None, transforms_path:str=None):
+    data = self.transforms
+    if transforms_path != None:
+      with open(transforms_path, 'r') as f:
+        data = json.load(f)
+    
+    cameras = [self.load_camera(i, transforms=data) for i in range(len(data['frames']))]
+
     return cameras
 
   def load_points(self, shuffle=False):
